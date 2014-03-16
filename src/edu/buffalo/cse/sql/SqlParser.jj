@@ -1,0 +1,446 @@
+PARSER_BEGIN ( SqlParser )
+
+package edu.buffalo.cse.sql;
+
+import java.util.Collection;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.FileInputStream;
+import java.io.File;
+import java.util.HashMap;
+
+import edu.buffalo.cse.sql.data.Datum;
+
+import edu.buffalo.cse.sql.plan.ExprTree;
+import edu.buffalo.cse.sql.plan.PlanNode;
+import edu.buffalo.cse.sql.plan.JoinNode;
+import edu.buffalo.cse.sql.plan.UnionNode;
+import edu.buffalo.cse.sql.plan.ProjectionNode;
+import edu.buffalo.cse.sql.plan.ScanNode;
+import edu.buffalo.cse.sql.plan.SelectionNode;
+import edu.buffalo.cse.sql.plan.NullSourceNode;
+import edu.buffalo.cse.sql.plan.AggregateNode;
+
+public class SqlParser {
+
+
+	public File file;
+	public SqlParser(File file)
+	{
+		this.file=file;
+	}
+	public static void main(String args []) throws IOException, ParseException
+	{
+	}
+	public Program execute() 
+	{
+
+		Program x=null;
+		SqlParser parser=null;
+		try
+		{
+			parser=new SqlParser(new java.io.FileReader(file));
+			x=parser.Program();
+			System.out.println("all tables and plannodes put");
+			System.out.println("number of plan nodes: "+x.tables.size());
+			
+		}
+		catch(ParseException e)
+		{
+			System.out.println("ParseException: "+e);
+			// parser.ReInit(new java.io.StringReader(strLine));
+		}
+		catch(Exception e)
+		{
+			System.out.println("NOK");
+			System.out.println(e.getMessage());
+			//	parser.ReInit(new java.io.FileReader(file));
+		}
+		catch(Error e)
+		{
+			System.out.println("oops");
+			System.out.println(e.getMessage());
+		}
+		return x;
+		
+	}
+  public static class Target {
+    public final String name;
+    public final ExprTree expr; 
+    public final AggregateNode.AType agg;
+    
+    public Target(String name, ExprTree expr)
+      { this.name = name; this.expr = expr; this.agg = null; }
+    
+    public Target(String name, ExprTree expr, AggregateNode.AType agg)
+      { this.name = name; this.expr = expr; this.agg = agg; }
+    
+    public boolean isAgg() { return agg != null; }
+    public ProjectionNode.Column asCol()
+      { return new ProjectionNode.Column(name, expr); }
+      
+    public AggregateNode.AggColumn asAgg()
+      { return new AggregateNode.AggColumn(name, expr, agg); }
+  }
+
+}
+
+PARSER_END ( SqlParser )
+
+Program Program() :
+  { Program p = new Program(); }
+  {
+    ( Statement(p) <EOS> )+ <EOF>
+      { return p; }
+  }
+
+void Statement(Program p) :
+  { PlanNode q;  }
+  { 
+      q = Select(p, null) { p.addQuery(q); }
+    | Table(p)
+  }
+
+void Table(Program p) :
+  { Token tableName; Schema.Table schema;
+  	String sourceTableName; 
+    String file = null; }
+  { <CREATE> <TABLE> tableName = <ID> 
+    <LPAREN> schema = TableSchema() <RPAREN> 
+    ( <FROM> <FILE> file = StringBase() <USING> (<CSV> | ( < TPCH > <LPAREN > sourceTableName=StringBase()< RPAREN >)) )?
+    { 
+      try
+      { 
+        p.addTable(tableName.image, 
+                   new Schema.TableFromFile(new File(file), schema));
+      }
+      catch(SqlException e)
+      { 
+        throw new ParseException(e.getMessage()); 
+      }
+    }
+  }
+
+Schema.Table TableSchema() :
+  { Schema.Table schema = new Schema.Table();
+    Schema.Column col; }
+  { col = ColSchema() { schema.add(col); }
+    ( <COMMA> col = ColSchema() { schema.add(col); } )*
+    { return schema; }
+  }
+
+Schema.Column ColSchema() :
+  { Token colName; Schema.Type type; }
+  { colName = <ID> type = TypeBase()
+      { return new Schema.Column(null, colName.image, type); } 
+  }
+
+
+PlanNode Select(Program p, String rangeVariable) : 
+  {
+    Token token;
+    List<Target> tgtList;
+    PlanNode source = new NullSourceNode(1);
+    ExprTree where = null;
+    PlanNode unionRHS = null;
+    Token unionAll = null;
+    List<ExprTree> gbList = null;
+    List<ProjectionNode.Column> orList=null;
+  }
+  {
+    <SELECT> tgtList = SelectTargetList()
+      ( <FROM> source = SourceList(p) )?
+      ( <WHERE> where = Expr() { source =SelectionNode.make(source, where); } )?
+      ( <GROUP> <BY> gbList = GroupByList() )?
+   
+      ( <ORDER> <BY> orList()  (< LIMIT > token =< DECIMAL >)?
+     
+      )?        
+      ( <UNION> (unionAll = <ALL>)? unionRHS = Select(p, rangeVariable) )?
+    { 
+      ArrayList<ProjectionNode.Column> pTgtList 
+                    = new ArrayList<ProjectionNode.Column>();
+      ArrayList<AggregateNode.AggColumn> aTgtList 
+                    = new ArrayList<AggregateNode.AggColumn>();
+      for(Target t : tgtList){ 
+        if(t.isAgg()){ aTgtList.add(t.asAgg()); }
+        else         { pTgtList.add(t.asCol()); }
+      }
+      if(aTgtList.size() > 0 || (gbList != null)){
+        if(gbList == null) { gbList = new ArrayList<ExprTree>(); }
+        List<ExprTree> unmatchedGbList = new ArrayList<ExprTree>();
+        unmatchedGbList.addAll(gbList);
+        for(int i = 0; i < pTgtList.size(); i++){
+          if(!gbList.contains(pTgtList.get(i).expr)){
+            throw new ParseException("Expression "+
+                          pTgtList.get(i).expr.toString()+
+                          " is neither an aggregate nor in the group by list");
+          }
+          unmatchedGbList.remove(pTgtList.get(i).expr);
+        }
+        if(unmatchedGbList.size() == 0){
+          source = 
+            AggregateNode.make(rangeVariable, source, pTgtList, aTgtList);
+        } else {
+          List<ProjectionNode.Column> discardGroupList = 
+            new ArrayList<ProjectionNode.Column>();
+          List<ProjectionNode.Column> passThroughList =
+            new ArrayList<ProjectionNode.Column>();
+          for(ProjectionNode.Column tgt : pTgtList){
+            discardGroupList.add(tgt);
+            passThroughList.add(
+              new ProjectionNode.Column(tgt.name, 
+                new ExprTree.VarLeaf(rangeVariable, tgt.name))
+            );
+          }
+          int i = 0;
+          for(ExprTree discardedGroup : unmatchedGbList){
+            discardGroupList.add(
+              new ProjectionNode.Column("DISCARD"+i,discardedGroup)
+            );
+            i++;
+          }
+          source = 
+            ProjectionNode.make(rangeVariable,
+              AggregateNode.make(rangeVariable, source, 
+                                 discardGroupList, aTgtList),
+              passThroughList
+            );
+        }
+      } else {
+        source = ProjectionNode.make(rangeVariable, source, pTgtList);
+      }
+      if(unionRHS == null){ return source; }
+      else { 
+        if(unionAll == null) {
+          return UnionNode.makeDistinct(source, unionRHS); 
+        } else {
+          return UnionNode.make(source, unionRHS); 
+        }
+      }
+    }
+  }
+
+List<ExprTree> GroupByList() :
+  { List<ExprTree> ret = new ArrayList<ExprTree>();
+    ExprTree col; }
+  { (col = Expr() { ret.add(col); } 
+      (<COMMA> col = Expr() { ret.add(col); })*)
+    { return ret; }
+  }
+
+void orList() :
+{ String expr = null;
+    ExprTree e;
+    ExprTree.VarLeaf v;}
+{
+<ID> (<PERIOD><ID>)? (< ORDERTYPE >)? 
+(<COMMA><ID><PERIOD><ID> (< ORDERTYPE > <COMMA >)?)*
+}
+
+  
+
+  
+PlanNode SourceList(Program p) : 
+  { PlanNode s1, s2; }
+  { s1 = ExtendedSource(p) 
+    (<COMMA> s2 = ExtendedSource(p) { s1 = JoinNode.make(s1, s2); } )* 
+    { return s1; }
+  }
+
+PlanNode ExtendedSource(Program p) :
+  { PlanNode s1, s2;
+    ExprTree condition = null;
+   }
+  { s1 = Source(p)
+    ( ( <JOIN> s2 = Source(p) )
+      ( <ON> condition = Expr() )?
+        { s1 = JoinNode.make(s1, s2);
+          if(condition != null){
+            s1 = SelectionNode.make(s1, condition);
+          }
+        }
+    )*
+    { return s1; }
+  }
+
+PlanNode Source(Program p) :
+  { Token source; Token name = null; }
+  { source = <ID> ( (<AS>)? name = <ID> )?
+      { try { 
+          Schema.Table sch = p.getTable(source.image);
+          return (name == null) ? 
+              new ScanNode(source.image, sch) : 
+              new ScanNode(source.image, name.image, sch);
+        } catch (SqlException e) {
+          throw new ParseException(e.getMessage());
+        }
+      }
+  }
+
+List<Target> SelectTargetList() :
+  { ArrayList<Target> tgtList = new ArrayList<Target>(); Target tgt; }
+  {
+    tgt = SelectTarget() { tgtList.add(tgt); }
+    ( <COMMA> 
+      tgt = SelectTarget() { tgtList.add(tgt); }
+    )* 
+    { return tgtList; }
+  }
+
+Target SelectTarget() :
+  { ExprTree e; Token id = null; String name; AggregateNode.AType agg = null; }
+  {
+    (   e = Expr() { name = e.makeName(); }
+      | ( <SUM> { agg = AggregateNode.AType.SUM; name = "Sum"; } 
+        | <AVG> { agg = AggregateNode.AType.AVG; name = "Average"; }
+        | <MIN> { agg = AggregateNode.AType.MIN; name = "Min"; } 
+        | <MAX> { agg = AggregateNode.AType.MAX; name = "Max"; } 
+        ) <LPAREN> e = Expr() <RPAREN>
+      | <COUNT> <LPAREN> <TIMES> <RPAREN> 
+                { agg = AggregateNode.AType.COUNT; name = "Count"; 
+                  e = new ExprTree.ConstLeaf(1); }
+    )
+    ( (<AS>)? id = <ID> { name = id.image; } )?
+    { return new Target(name, e, agg); }
+  }
+
+
+ExprTree Expr() :
+  { ExprTree e1, e2; ExprTree.OpCode op; }
+  {
+    e1 = UnaryExpr()
+    ( ( op = ArithOp() | op = BinOp() | op = CmpOp() )
+      e2 = UnaryExpr() 
+        { e1 = new ExprTree(op, e1, e2); } 
+    )* 
+    { return e1; }
+  }
+
+ExprTree.OpCode ArithOp() : 
+  {}
+  {
+      <PLUS>    { return ExprTree.OpCode.ADD; }
+    | <TIMES>   { return ExprTree.OpCode.MULT; }
+    | <MINUS>   { return ExprTree.OpCode.SUB; }
+    | <DIVIDE>  { return ExprTree.OpCode.DIV; }
+  }
+
+ExprTree.OpCode BinOp() : 
+  {}
+  {
+      <AND>  { return ExprTree.OpCode.AND; }
+    | <OR>   { return ExprTree.OpCode.OR; }
+  }
+
+ExprTree.OpCode CmpOp() :
+  {}
+  {
+      <EQ>  { return ExprTree.OpCode.EQ; }
+    | <NEQ> { return ExprTree.OpCode.NEQ; }
+    | <LT>  { return ExprTree.OpCode.LT; }
+    | <GT>  { return ExprTree.OpCode.GT; }
+    | <LTE> { return ExprTree.OpCode.LTE; }
+    | <GTE> { return ExprTree.OpCode.GTE; }
+  }
+
+ExprTree UnaryExpr() :
+  { float f; int i; String s; Token s1; Token s2 = null; ExprTree e; }
+  {
+      f = FloatBase()  { return new ExprTree.ConstLeaf(f); }
+    | i = IntBase()    { return new ExprTree.ConstLeaf(i); }
+    | s = StringBase() { return new ExprTree.ConstLeaf(s); }
+    | (s1 = <ID> (<PERIOD> s2 = <ID>)?) {
+        return (s2 == null) ? new ExprTree.VarLeaf(s1.image) 
+                            : new ExprTree.VarLeaf(s1.image, s2.image); }
+    | <LPAREN> e = Expr() <RPAREN> { return e; }
+    | <NOT> e = Expr() { return new ExprTree(ExprTree.OpCode.NOT, e); }
+    | <TRUE>           { return new ExprTree.ConstLeaf(true); }
+    | <FALSE>          { return new ExprTree.ConstLeaf(false); }
+  }
+
+Schema.Type TypeBase() :
+  { }
+  {   <TINT>     { return Schema.Type.INT; }
+    | <TFLOAT>   { return Schema.Type.FLOAT; }
+    | <TSTRING>  { return Schema.Type.STRING; }
+  }
+
+String StringBase() :
+  { Token t; }
+  { t = <STRING> { 
+    String bs = Character.toString((char)(92));
+    return t.image.substring(1, t.image.length()-1).
+      replaceAll(bs+bs+"'", "'").
+      replaceAll(bs+bs+bs+bs, bs+bs);
+   } }
+
+float FloatBase() :
+  { Token t; }
+  { t = <FLOAT> { return Float.parseFloat(t.image); } }
+
+int IntBase() :
+  { Token t; }
+  { t = <DECIMAL> { return Integer.parseInt(t.image); } }
+
+SKIP : { " " }
+SKIP : { "\n" | "\r" | "\r\n" }
+TOKEN [IGNORE_CASE] : { 
+    < SELECT  : "SELECT" > 
+  | < AS      : "AS" >
+  | < FROM    : "FROM" >
+  | < WHERE   : "WHERE" >
+  | < GROUP   : "GROUP" >
+  | < ORDERTYPE :"DESC" >
+  | < BY      : "BY" >
+  | < UNION   : "UNION" >
+  | < ORDER   : "ORDER" >
+  | < ALL     : "ALL" >
+  | < SUM     : "SUM" >
+  | < AVG     : "AVG" >
+  | < COUNT   : "COUNT" >
+  | < MIN     : "MIN" >
+  | < MAX     : "MAX" >
+  | < FILE    : "FILE" >
+  | < USING   : "USING" >
+  | < CSV     : "CSV" >
+  | < TPCH    : "TPCH" >
+  | < NATURAL : "NATURAL" >
+  | < JOIN    : "JOIN" >
+  | < ON      : "ON" >
+  | < CREATE  : "CREATE" >
+  | < TABLE   : "TABLE" >
+  | < TINT    : "INT" >
+  | < TFLOAT  : "FLOAT" >
+  | < TSTRING : "STRING" >
+  | < DECIMAL : ("-")?(["0"-"9"])+ > 
+  | < FLOAT   : ("-")?((["0"-"9"])+"."(["0"-"9"])*("e"("-")?(["0"-"9"])+)?) > 
+  | < STRING  : "'" ((~["'"] | ("\\'") | ("\\\\"))*) "'" >
+  | < PERIOD  : "." >
+  | < COMMA   : "," >
+  | < EOS     : ";" >
+  | < PLUS    : "+" >
+  | < TIMES   : "*" > 
+  | < MINUS   : "-" >
+  | < DIVIDE  : "/" >
+  | < EQ      : "=" >
+  | < NEQ     : "<>" >
+  | < LT      : "<" >
+  | < LIMIT   : "LIMIT" >
+  | < GT      : ">" >
+  | < LTE     : "<=" >
+  | < GTE     : ">=" >
+  | < AND     : "AND" >
+  | < OR      : "OR" >
+  | < NOT     : "NOT" >
+  | < LPAREN  : "(" >
+  | < RPAREN  : ")" >
+  | < TRUE    : "TRUE" >
+  | < FALSE   : "FALSE" >
+  | < ID      : (["A"-"Z","_"])(["A"-"Z","0"-"9","_"])* >
+  
+}

@@ -1,0 +1,3 @@
+CREATE TABLE R (A int, B int) FROM FILE 'test/r.dat' USING CSV;
+
+SELECT A, MAX(B) FROM R GROUP BY A;

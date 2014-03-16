@@ -1,0 +1,6 @@
+CREATE TABLE R (A int, B int) FROM FILE 'test/r.dat' USING CSV;
+CREATE TABLE S (A int, B int) FROM FILE 'test/s.dat' USING CSV;
+
+SELECT A, B FROM R
+  UNION
+SELECT A, B FROM S;
